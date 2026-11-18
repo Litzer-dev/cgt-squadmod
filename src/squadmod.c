@@ -23,7 +23,18 @@ static struct {
     int loopback;       // same-PC testing
     int freeMouse;      // DirectInput non-exclusive (don't lock the cursor)
     int debug;          // extra diagnostic hooks (order handler / net send logging)
+    int steam;          // play over Steam (virtual LAN through a Steam lobby)
+    int tunnelTest;     // with loopback: route the two copies through the tunnel (tests the Steam path without Steam)
 } cfg;
+
+// tunnel.c
+int    Tun_Start(int mode, int instance, const char *dir, void (*log)(const char *, ...),
+                 void *(*patch)(const char *, const char *, void *), u_long *pHostIp);
+int    Tun_Active(void);
+u_long Tun_SelfAddr(void);
+const char *Tun_PlayerName(void);
+int WINAPI Tun_Sendto(SOCKET s, const char *buf, int len, int flags, const struct sockaddr *to, int tolen);
+#define RSendto(...) (Tun_Active() ? Tun_Sendto(__VA_ARGS__) : sendto(__VA_ARGS__))
 
 static int  g_instance = 1;
 static char g_dir[MAX_PATH];
@@ -650,7 +661,7 @@ static void RelayOpen(void)
     u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
     struct sockaddr_in a; memset(&a, 0, sizeof a);
     a.sin_family = AF_INET; a.sin_port = htons(RELAY_PORT);
-    a.sin_addr.s_addr = cfg.loopback ? LoopAddr(g_instance) : INADDR_ANY;
+    a.sin_addr.s_addr = Tun_Active() ? Tun_SelfAddr() : cfg.loopback ? LoopAddr(g_instance) : INADDR_ANY;
     if (bind(s, (struct sockaddr *)&a, sizeof a) != 0)
         logf("relay: bind :%d failed %d (sending still works)", RELAY_PORT, WSAGetLastError());
     g_relaySock = s;
@@ -662,7 +673,7 @@ static void RelaySend(int op, void *ctl, void *own, void *member, uint32_t arg)
 {
     if (g_inRelay || !IsNetClient()) return;
     RelayOpen();
-    if (!g_hostIp && cfg.loopback) g_hostIp = LoopAddr(g_instance == 1 ? 2 : 1);
+    if (!g_hostIp && cfg.loopback && !Tun_Active()) g_hostIp = LoopAddr(g_instance == 1 ? 2 : 1);
     if (g_relaySock == INVALID_SOCKET || !g_hostIp) { logf("relay: no host address yet, %s not sent", OpName(op)); return; }
     static uint32_t seq;
     RelayPkt p; memset(&p, 0, sizeof p);
@@ -680,7 +691,7 @@ static void RelaySend(int op, void *ctl, void *own, void *member, uint32_t arg)
     }
     struct sockaddr_in to; memset(&to, 0, sizeof to);
     to.sin_family = AF_INET; to.sin_port = htons(RELAY_PORT); to.sin_addr.s_addr = g_hostIp;
-    int r = sendto(g_relaySock, (const char *)&p, sizeof p, 0, (struct sockaddr *)&to, sizeof to);
+    int r = RSendto(g_relaySock, (const char *)&p, sizeof p, 0, (struct sockaddr *)&to, sizeof to);
     char b[32];
     logf("relay -> %s #%u %s own=%d member=%d arg=%u (ctl: %d entity, %d local ptr) = %d",
          IpStr(g_hostIp, to.sin_port, b), p.seq, OpName(op), (int)p.ownId, (int)p.memberId, arg, nEnt, nKeep, r);
@@ -888,7 +899,7 @@ static void RelaySendTo(int op, uint32_t ownId, uint32_t memberId, uint32_t arg,
     p.magic = RELAY_MAGIC; p.seq = ++seq; p.op = op; p.ownId = ownId; p.memberId = memberId; p.arg = arg;
     struct sockaddr_in to; memset(&to, 0, sizeof to);
     to.sin_family = AF_INET; to.sin_port = portN; to.sin_addr.s_addr = ip;
-    int r = sendto(g_relaySock, (const char *)&p, sizeof p, 0, (struct sockaddr *)&to, sizeof to);
+    int r = RSendto(g_relaySock, (const char *)&p, sizeof p, 0, (struct sockaddr *)&to, sizeof to);
     char b[32]; logf("relay -> %s #%u %s own=%d member=%d arg=%d = %d", IpStr(ip, portN, b), p.seq, OpName(op),
                      (int)ownId, (int)memberId, (int)arg, r);
 }
@@ -907,7 +918,7 @@ static void MakeLocal(void *e)
 }
 static void ClientRequestSwitch(void *cur, int dir)
 {
-    if (!g_hostIp && cfg.loopback) g_hostIp = LoopAddr(g_instance == 1 ? 2 : 1);
+    if (!g_hostIp && cfg.loopback && !Tun_Active()) g_hostIp = LoopAddr(g_instance == 1 ? 2 : 1);
     RelaySendTo(OP_SWITCH, EntId(cur), 0xFFFFFFFFu, (uint32_t)dir, g_hostIp, htons(RELAY_PORT));
 }
 static void HostHandleSwitch(const RelayPkt *p, const struct sockaddr_in *from)
@@ -1041,12 +1052,12 @@ static void RelayPump(void *handlerSelf)
         static DWORD helloT;
         if (GetTickCount() - helloT > 1000) {
             helloT = GetTickCount();
-            if (!g_hostIp && cfg.loopback) g_hostIp = LoopAddr(g_instance == 1 ? 2 : 1);
+            if (!g_hostIp && cfg.loopback && !Tun_Active()) g_hostIp = LoopAddr(g_instance == 1 ? 2 : 1);
             if (g_hostIp) {   // quiet send (no log spam)
                 RelayPkt h; memset(&h, 0, sizeof h); h.magic = RELAY_MAGIC; h.op = OP_HELLO;
                 struct sockaddr_in to; memset(&to, 0, sizeof to);
                 to.sin_family = AF_INET; to.sin_port = htons(RELAY_PORT); to.sin_addr.s_addr = g_hostIp;
-                sendto(g_relaySock, (const char *)&h, sizeof h, 0, (struct sockaddr *)&to, sizeof to);
+                RSendto(g_relaySock, (const char *)&h, sizeof h, 0, (struct sockaddr *)&to, sizeof to);
             }
         }
         return;
@@ -1087,7 +1098,7 @@ static void RelayPump(void *handlerSelf)
         }
         h.arg = (uint32_t)n;
         for (int k = 0; k < g_nClients; k++)
-            sendto(g_relaySock, (const char *)&h, sizeof h, 0, (struct sockaddr *)&g_clients[k], sizeof g_clients[k]);
+            RSendto(g_relaySock, (const char *)&h, sizeof h, 0, (struct sockaddr *)&g_clients[k], sizeof g_clients[k]);
     }
 }
 
@@ -1388,47 +1399,142 @@ static pfnD3DCreate9      real_D3DCreate9;
 static pfnD3DCreateDevice real_D3DCreateDevice;
 static pfnD3DReset        real_D3DReset;
 
-static void ForceWindowedPP(void *pp, const char *who)
+// Display mode follows the game's own VIDEO screen (RESOLUTION + WINDOWED):
+// D3D always runs windowed underneath (alt-tab safe, works with dgVoodoo);
+//   WINDOWED on  -> normal window sized to the chosen resolution
+//   WINDOWED off -> borderless window covering the monitor (dgVoodoo scales)
+// The two-copies test (LoopbackTest) always uses normal side-by-side windows.
+static HWND g_gameWnd;
+
+// Display settings chosen in the VIDEO screen, kept in squadmod.ini [Display]
+// (the game itself always starts at 800x600 fullscreen).
+static char     g_ini[MAX_PATH];
+static int      g_dispWindowed;          // WINDOWED toggle: 1 = window, 0 = borderless fullscreen
+static uint32_t g_saveW, g_saveH;        // saved resolution (0 = none yet)
+static uint32_t g_curW, g_curH;          // current back buffer size
+static int      g_resetSeen;
+
+static void LoadDisplay(void)
 {
-    if (!pp) return;
-    uint32_t w = U32(pp, 0x00), h = U32(pp, 0x04);
-    logf("%s: %ux%u windowed=%u refresh=%u -> windowed", who, w, h, U32(pp, 0x20), U32(pp, 0x30));
-    U32(pp, 0x20) = 1;   // Windowed
-    U32(pp, 0x30) = 0;   // FullScreen_RefreshRateInHz must be 0 when windowed
+    g_dispWindowed = GetPrivateProfileIntA("Display", "Windowed", 0, g_ini) != 0;
+    g_saveW = (uint32_t)GetPrivateProfileIntA("Display", "Width", 0, g_ini);
+    g_saveH = (uint32_t)GetPrivateProfileIntA("Display", "Height", 0, g_ini);
+}
+static void SaveDisplay(void)
+{
+    char v[16];
+    snprintf(v, sizeof v, "%d", g_dispWindowed); WritePrivateProfileStringA("Display", "Windowed", v, g_ini);
+    if (g_curW && g_curH) {
+        snprintf(v, sizeof v, "%u", g_curW); WritePrivateProfileStringA("Display", "Width", v, g_ini);
+        snprintf(v, sizeof v, "%u", g_curH); WritePrivateProfileStringA("Display", "Height", v, g_ini);
+        g_saveW = g_curW; g_saveH = g_curH;
+    }
+    logf("display settings saved: %ux%u %s", g_curW, g_curH, g_dispWindowed ? "windowed" : "fullscreen");
 }
 
-static void MakeNormalWindow(HWND wnd, uint32_t w, uint32_t h)
+static void ApplyWindow(HWND wnd, uint32_t w, uint32_t h, int windowed)
 {
     if (!wnd || !w || !h) return;
-    LONG style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE | WS_CLIPSIBLINGS;
-    SetWindowLongA(wnd, GWL_STYLE, style);
-    SetWindowLongA(wnd, GWL_EXSTYLE, WS_EX_APPWINDOW);
-    RECT r = { 0, 0, (LONG)w, (LONG)h };
-    AdjustWindowRect(&r, style, FALSE);
-    int ww = r.right - r.left, wh = r.bottom - r.top;
-    int sw = GetSystemMetrics(SM_CXSCREEN);
-    int x = g_instance == 1 ? 0 : (sw - ww > 0 ? sw - ww : 40);
-    real_SetWindowPos(wnd, HWND_NOTOPMOST, x, 0, ww, wh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-    char title[64];
-    snprintf(title, sizeof title, "Conflict: Global Terror [%s %d]", g_instance == 1 ? "copy" : "copy", g_instance);
-    SetWindowTextA(wnd, title);
+    if (!windowed && !cfg.loopback) {
+        HMONITOR mon = MonitorFromWindow(wnd, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi = { sizeof mi };
+        GetMonitorInfoA(mon, &mi);
+        SetWindowLongA(wnd, GWL_STYLE, WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS);
+        SetWindowLongA(wnd, GWL_EXSTYLE, WS_EX_APPWINDOW);
+        real_SetWindowPos(wnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                          mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                          SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        logf("display: %ux%u borderless fullscreen", w, h);
+    } else {
+        LONG style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE | WS_CLIPSIBLINGS;
+        SetWindowLongA(wnd, GWL_STYLE, style);
+        SetWindowLongA(wnd, GWL_EXSTYLE, WS_EX_APPWINDOW);
+        RECT r = { 0, 0, (LONG)w, (LONG)h };
+        AdjustWindowRect(&r, style, FALSE);
+        int ww = r.right - r.left, wh = r.bottom - r.top;
+        int sw = GetSystemMetrics(SM_CXSCREEN), shh = GetSystemMetrics(SM_CYSCREEN);
+        int x, y;
+        if (cfg.loopback) { x = g_instance == 1 ? 0 : (sw - ww > 0 ? sw - ww : 40); y = 0; }
+        else { x = (sw - ww) / 2; y = (shh - wh) / 2; if (x < 0) x = 0; if (y < 0) y = 0; }
+        real_SetWindowPos(wnd, HWND_NOTOPMOST, x, y, ww, wh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        logf("display: %ux%u window", w, h);
+    }
+    if (cfg.loopback) {
+        char title[64];
+        snprintf(title, sizeof title, "Conflict: Global Terror [copy %d]", g_instance);
+        SetWindowTextA(wnd, title);
+    }
+}
+
+// Rewrites the present parameters to windowed and returns the game's requested mode.
+static int TakeDisplayPP(void *pp, const char *who)
+{
+    uint32_t w = U32(pp, 0x00), h = U32(pp, 0x04);
+    int windowed = U32(pp, 0x20) != 0;
+    logf("%s: game asks %ux%u %s", who, w, h, windowed ? "windowed" : "fullscreen");
+    U32(pp, 0x20) = 1;   // Windowed
+    U32(pp, 0x30) = 0;   // FullScreen_RefreshRateInHz must be 0 when windowed
+    return windowed;
+}
+
+typedef HRESULT (WINAPI *pfnD3DPresent)(void *self, const void *src, const void *dst, HWND wnd, const void *rgn);
+static pfnD3DPresent real_D3DPresent;
+static void FixVideoScreen(void);
+static void RestoreDisplay(void);
+static void MenuFrame(void);
+static HRESULT WINAPI Hook_D3DPresent(void *self, const void *src, const void *dst, HWND wnd, const void *rgn)
+{
+    FixVideoScreen();
+    MenuFrame();
+    HRESULT hr = real_D3DPresent(self, src, dst, wnd, rgn);
+    RestoreDisplay();   // once, between frames: re-apply the saved resolution
+    return hr;
 }
 
 static HRESULT WINAPI Hook_D3DReset(void *self, void *pp)
 {
-    ForceWindowedPP(pp, "Reset");
-    return real_D3DReset(self, pp);
+    if (!pp) return real_D3DReset(self, pp);
+    TakeDisplayPP(pp, "Reset");
+    int windowed = g_dispWindowed;
+    HWND wnd = U32(pp, 0x1C) ? (HWND)(uintptr_t)U32(pp, 0x1C) : g_gameWnd;
+    ApplyWindow(wnd, U32(pp, 0), U32(pp, 4), windowed);
+    HRESULT hr = real_D3DReset(self, pp);
+    logf("Reset hr=%08X", (unsigned)hr);
+    if (SUCCEEDED(hr)) { g_curW = U32(pp, 0); g_curH = U32(pp, 4); g_resetSeen = 1; }
+    return hr;
 }
 
 static HRESULT WINAPI Hook_D3DCreateDevice(void *self, UINT ad, int type, HWND wnd, DWORD flags, void *pp, void **dev)
 {
-    ForceWindowedPP(pp, "CreateDevice");
+    if (pp) { TakeDisplayPP(pp, "CreateDevice"); g_curW = U32(pp, 0); g_curH = U32(pp, 4); }
+    int windowed = g_dispWindowed;
     HWND target = (pp && U32(pp, 0x1C)) ? (HWND)(uintptr_t)U32(pp, 0x1C) : wnd;
-    MakeNormalWindow(target, pp ? U32(pp, 0) : 0, pp ? U32(pp, 4) : 0);
+    g_gameWnd = target;
+    if (pp) ApplyWindow(target, U32(pp, 0), U32(pp, 4), windowed);
     HRESULT hr = real_D3DCreateDevice(self, ad, type, wnd, flags, pp, dev);
     logf("CreateDevice hr=%08X", (unsigned)hr);
     if (SUCCEEDED(hr) && dev && *dev)        // IDirect3DDevice9::Reset = slot 16
+    {
         PatchVtbl(*(void ***)*dev, 16, (void *)Hook_D3DReset, (void **)&real_D3DReset);
+        PatchVtbl(*(void ***)*dev, 17, (void *)Hook_D3DPresent, (void **)&real_D3DPresent);   // Present
+    }
+    return hr;
+}
+
+typedef UINT (WINAPI *pfnModeCount)(void *self, UINT ad, DWORD fmt);
+typedef HRESULT (WINAPI *pfnEnumModes)(void *self, UINT ad, DWORD fmt, UINT i, uint32_t *mode);
+static pfnModeCount real_ModeCount;
+static pfnEnumModes real_EnumModes;
+static UINT WINAPI Hook_ModeCount(void *self, UINT ad, DWORD fmt)
+{
+    UINT n = real_ModeCount(self, ad, fmt);
+    logf("modes: adapter %u format %u -> %u modes", ad, (unsigned)fmt, n);
+    return n;
+}
+static HRESULT WINAPI Hook_EnumModes(void *self, UINT ad, DWORD fmt, UINT i, uint32_t *mode)
+{
+    HRESULT hr = real_EnumModes(self, ad, fmt, i, mode);
+    if (SUCCEEDED(hr) && mode) logf("modes:   #%u %ux%u @%u fmt %u", i, mode[0], mode[1], mode[2], mode[3]);
     return hr;
 }
 
@@ -1437,6 +1543,10 @@ static void *WINAPI Hook_D3DCreate9(UINT sdk)
     void *d3d = real_D3DCreate9(sdk);
     if (d3d)                                  // IDirect3D9::CreateDevice = slot 16
         PatchVtbl(*(void ***)d3d, 16, (void *)Hook_D3DCreateDevice, (void **)&real_D3DCreateDevice);
+    if (d3d && cfg.debug) {                   // GetAdapterModeCount = 6, EnumAdapterModes = 7
+        PatchVtbl(*(void ***)d3d, 6, (void *)Hook_ModeCount, (void **)&real_ModeCount);
+        PatchVtbl(*(void ***)d3d, 7, (void *)Hook_EnumModes, (void **)&real_EnumModes);
+    }
     return d3d;
 }
 
@@ -1459,9 +1569,610 @@ static void LoadRealDinput8(void)
 }
 
 // ----------------------------------------------------------- startup ---
+// 0x58f300 (session thiscall): copy the local player name (session+0x5018, set from the
+// save profile by 0x58f2e0) into this machine's slot record and mark the session
+// dirty so it is sent to the other players. Reimplemented to use the Steam name.
+static int g_useSteamName = 1;   // squadmod.ini SteamName (STEAM screen)
+static void __fastcall Hook_ApplyLocalName(uint8_t *session)
+{
+    uint8_t slot = *(uint8_t *)A_LOCAL_SLOT;
+    if (slot > 0xFD) return;
+    const char *steam = g_useSteamName ? Tun_PlayerName() : NULL;
+    if (steam && strcmp((char *)session + 0x5018, steam)) {
+        logf("player name: '%s' -> Steam name '%s'", (char *)session + 0x5018, steam);
+        strcpy((char *)session + 0x5018, steam);
+    }
+    U32(session, 0x230) = 1;
+    strcpy((char *)session + slot * 0x8C, (char *)session + 0x5018);
+    U32(session, 0x230) = 0;
+    U32(session, 0x234) = 1;
+}
+
+// ---- game VIDEO screen (SCR_VIDEO) -------------------------------------------
+// 0x417cf0 (cdecl, w, h) decides which display modes the VIDEO screen lists. The
+// list holds at most 8 entries (tables at 0x739600 / 0x739620), so allow a short
+// set of common sizes plus the desktop size.
+static int ModeAllowed(int w, int h)
+{
+    static const int std[][2] = { {800,600}, {1024,768}, {1280,720}, {1280,1024},
+                                  {1366,768}, {1600,900}, {1920,1080} };
+    int dw = GetSystemMetrics(SM_CXSCREEN), dh = GetSystemMetrics(SM_CYSCREEN);
+    if (w > dw || h > dh) return 0;
+    if (w == dw && h == dh) return 1;
+    for (unsigned i = 0; i < sizeof std / sizeof std[0]; i++)
+        if (std[i][0] == w && std[i][1] == h) return 1;
+    return 0;
+}
+static int __cdecl Hook_ModeFilter(int w, int h) { return ModeAllowed(w, h); }
+
+// SCR_VIDEO event 0x1e (screen opened) ends with call 0x51f090 at 0x520e73. The PC
+// build hides TOG_WINDOWED there (widget flag 0x8000 = visible); show it again.
+typedef void  (__fastcall *pfnScreenFn)(void *self, void *edx);
+typedef void *(__fastcall *pfnFindWidget)(void *container, void *edx, uint32_t id);
+#define FindWidget ((pfnFindWidget)0x005a0160)
+// Rows of SCR_VIDEO in display order (TOG_DEVICE and BN_RESET_WINDOW stay hidden).
+static const uint32_t kVideoRows[] = {
+    0x256da361,   // TOG_RESOLUTION
+    0x96109e70,   // TOG_COLOUR_DEPTH
+    0xf03fcd4a,   // TOG_WINDOWED   (hidden by the PC build, half-overlapping slot)
+    0xacf936f4,   // BN_DEFAULT
+    0x991ebb3f,   // BN_SCAN_HARDWARE
+    0xcd8e30b8,   // BN_ADVANCED_SETTINGS
+    0x3a21c6fd,   // BN_APPLY
+};
+#define VIDEO_ROWS (sizeof kVideoRows / sizeof kVideoRows[0])
+static uint8_t *g_videoRow[VIDEO_ROWS];
+static uint8_t *g_togWindowed;   // = g_videoRow[2]; widgets are built once at startup
+static uint8_t *g_videoScreen;
+
+// Toggle widget: value byte +0x74, min +0x75, max +0x76 (0 = NO, 1 = YES).
+static void SetWindowedToggle(void)
+{
+    if (!g_togWindowed) return;
+    U8(g_togWindowed, 0x75) = 0; U8(g_togWindowed, 0x76) = 1;
+    U8(g_togWindowed, 0x74) = (uint8_t)(g_dispWindowed != 0);
+}
+
+static void __fastcall Hook_VideoScreenOpened(uint8_t *screen, void *edx)
+{
+    ((pfnScreenFn)0x0051f090)(screen, edx);
+    uint8_t *group = FindWidget(screen + 0x24, 0, 0x4b5da259);
+    if (!group) return;              // also called for screens without the video rows
+    uint8_t *rows[VIDEO_ROWS];
+    for (unsigned i = 0; i < VIDEO_ROWS; i++)
+        if (!(rows[i] = FindWidget(group + 0x40, 0, kVideoRows[i]))) return;
+    if (!g_togWindowed) {            // widgets live for the whole session
+        for (unsigned i = 0; i < VIDEO_ROWS; i++) g_videoRow[i] = rows[i];
+        g_togWindowed = rows[2];
+        g_videoScreen = screen;
+        logf("video screen: WINDOWED option found");
+    }
+    SetWindowedToggle();
+}
+
+// Called every frame (Present): the game hides TOG_WINDOWED again whenever the screen
+// is entered, and its rows are rescaled on resolution changes. Re-show it and lay the
+// rows out evenly (rect at +0x24: x, y, w, h in the parent's coordinates).
+static void FixVideoScreen(void)
+{
+    if (!g_togWindowed) return;
+    U32(g_togWindowed, 0x20) |= 0x8000;
+    U8(g_togWindowed, 0x75) = 0; U8(g_togWindowed, 0x76) = 1;
+    if (U8(g_togWindowed, 0x74) > 1) U8(g_togWindowed, 0x74) = 1;
+    float *y0 = (float *)(g_videoRow[0] + 0x28), *y1 = (float *)(g_videoRow[1] + 0x28);
+    float step = *y1 - *y0;
+    if (step <= 0.0f) return;
+    for (unsigned i = 2; i < VIDEO_ROWS; i++)
+        *(float *)(g_videoRow[i] + 0x28) = *y1 + step * (float)(i - 1);
+}
+// 0x520200 refreshes SCR_VIDEO (on open, SET TO DEFAULTS, device change) and hides
+// TOG_WINDOWED each time; called from 6 places.
+static void __fastcall W_VideoRefresh(void *screen, void *edx)
+{
+    ((pfnScreenFn)0x00520200)(screen, edx);
+    if (g_togWindowed) U32(g_togWindowed, 0x20) |= 0x8000;
+    SetWindowedToggle();
+}
+// OPTIONS > VIDEO: the game selects the size from its own settings (800x600 after a
+// restart), so select the size the game is running at.
+static void __fastcall W_VideoEnter(void *screen, void *edx)
+{
+    W_VideoRefresh(screen, edx);
+    if (!g_videoRow[0] || !g_curW) return;
+    char cur[32];
+    snprintf(cur, sizeof cur, "%ux%u", g_curW, g_curH);
+    for (int i = 0; i <= U8(g_videoRow[0], 0x76) && i < 8; i++)
+        if (!strcmp((const char *)(uintptr_t)(0x00739620 + 48 * i), cur)) { U8(g_videoRow[0], 0x74) = (uint8_t)i; break; }
+}
+
+// APPLY: the game's own code (protected, 0x520cc0) changes the resolution via
+// D3D Reset; the mod adds the WINDOWED toggle and saves both to squadmod.ini.
+static void __fastcall W_VideoApply(uint8_t *screen, void *edx)
+{
+    int want = g_togWindowed ? (U8(g_togWindowed, 0x74) != 0) : g_dispWindowed;
+    int changed = want != g_dispWindowed;
+    g_dispWindowed = want;
+    g_resetSeen = 0;
+    ((pfnScreenFn)0x00520cc0)(screen, edx);
+    if (changed && !g_resetSeen) ApplyWindow(g_gameWnd, g_curW, g_curH, want);
+    SaveDisplay();
+}
+
+// Once after startup: select the saved resolution in the VIDEO screen and run APPLY.
+static void RestoreDisplay(void)
+{
+    static int done;
+    static DWORD readyAt;
+    if (done || !g_videoScreen) return;
+    // APPLY opens follow-up screens that are only built once the front end is up,
+    // so wait until the menus have been running for a while.
+    if (!readyAt) { readyAt = GetTickCount() + 6000; return; }
+    if ((int)(GetTickCount() - readyAt) < 0) return;
+    // ...and until the "keep these settings?" dialog APPLY shows has its widgets
+    // (0x50fec0 uses them unchecked).
+    uint8_t *dlg = *(uint8_t **)0x0072fc70;          // message box screen (vt 006CECD8)
+    int built = dlg != NULL;
+    for (int o = 0x74; built && o <= 0x8c; o += 4) {   // unbuilt slots hold 0 or 0xFAFAFAFA
+        uint32_t w = U32(dlg, o);
+        built = w >= 0x10000 && w != 0xFAFAFAFA && !IsBadReadPtr((void *)(uintptr_t)w, 4)
+             && *(uint32_t *)(uintptr_t)w - 0x00600000u < 0x00100000u;   // has a game vtable
+    }
+    if (!built) {
+        if ((int)(GetTickCount() - readyAt) < 60000) return;
+        done = 1; logf("display restore: settings dialog never built, skipped"); return;
+    }
+    done = 1;
+    if (!g_saveW || !g_saveH || (g_saveW == g_curW && g_saveH == g_curH)) return;
+    ((pfnScreenFn)0x00520200)(g_videoScreen, 0);           // builds the resolution list
+    char want[32];
+    snprintf(want, sizeof want, "%ux%u", g_saveW, g_saveH);
+    uint8_t *res = g_videoRow[0];
+    int max = U8(res, 0x76), found = -1;
+    for (int i = 0; i <= max && i < 8; i++)
+        if (!strcmp((const char *)(uintptr_t)(0x00739620 + 48 * i), want)) { found = i; break; }
+    if (found < 0) { logf("display restore: %s not in the mode list", want); return; }
+    U8(res, 0x74) = (uint8_t)found;
+    SetWindowedToggle();
+    logf("display restore: applying %s", want);
+    ((pfnScreenFn)0x00520cc0)(g_videoScreen, 0);
+    // APPLY opens the "keep these settings?" dialog (layer 4, object at 0x72fb4c) whose
+    // countdown reverts the change; close it the way the video screen's timeout does,
+    // without the revert: the saved settings are already known good.
+    typedef void *(__fastcall *pfnLayerGet)(void *mgr, void *edx, int layer);
+    typedef void  (__fastcall *pfnLayerClose)(void *mgr, void *edx, int layer);
+    void *ui = *(void **)0x00736b20;
+    if (ui && ((pfnLayerGet)0x00599980)(ui, 0, 4) == *(void **)0x0072fb4c) {
+        ((pfnLayerClose)0x00599690)(*(void **)((uint8_t *)ui + 0x28), 0, 4);
+        logf("display restore: confirmation dialog closed");
+    }
+}
+
+static void InstallVideoScreen(void)
+{
+    static const uint8_t thunk[] = { 0xFF, 0x25, 0x8C, 0xED, 0x17, 0x01 };   // jmp [0117ED8C]
+    if (!memcmp((void *)0x00417cf0, thunk, sizeof thunk) && WriteJmp(0x00417cf0, (void *)Hook_ModeFilter))
+        logf("video screen: resolution list widened");
+    else logf("video screen: unexpected bytes at 00417CF0, resolution list unchanged");
+    PatchCall(0x00520e73, 0x0051f090, (void *)Hook_VideoScreenOpened);
+    PatchCall(0x00513591, 0x00520200, (void *)W_VideoEnter);    // OPTIONS > VIDEO
+    static const uintptr_t refresh[] = { 0x00520699, 0x005206d8, 0x0052079e, 0x00520e6c, 0x00520eae };
+    for (unsigned i = 0; i < sizeof refresh / sizeof refresh[0]; i++)
+        PatchCall(refresh[i], 0x00520200, (void *)W_VideoRefresh);
+    PatchCall(0x00520e96, 0x00520cc0, (void *)W_VideoApply);   // BN_APPLY
+}
+
+
+// ---- STEAM and GRAPHICS screens in the game's OPTIONS menu --------------------------
+// The PC build hides two OPTIONS buttons (REFRESH RATE, CENTRE SCREEN) and never uses two
+// console screens (ONLINE OPTIONS, NETWORK OPTIONS). They become:
+//   OPTIONS > STEAM     (ONLINE OPTIONS:  3 buttons)  invite, player name, lobby
+//   OPTIONS > GRAPHICS  (NETWORK OPTIONS: 3 toggles + APPLY)  dgVoodoo.conf settings
+// Text: label widgets hold a string hash (+0x48) that the game looks up through
+// 0x686a10 when drawing; the mod answers its own hashes there.
+int  Tun_SteamStatus(void);
+void Tun_Invite(void);
+int  Tun_LobbyNames(char *out, int cap);
+
+#define UI_ROOT          (*(uint8_t **)0x00736b20)
+#define SCR_OPTIONS_ID   0x215067a4
+#define SCR_STEAM_ID     0x2ac24a2b   // SCR_ONLINE_OPTIONS
+#define SCR_GRAPHICS_ID  0x80862421   // SCR_NETWORK_OPTIONS
+#define SCR_MULTI_ID     0x50dc7ff1   // SCR_MULTIPLAYER_MENU (LAN / INTERNET)
+#define BN_INTERNET_ID   0xb6478360   // BN_ONLINE: GameSpy, servers are gone
+#define SCR_MAIN_ID      0xf23ea323   // main menu
+#define BN_GAMESPY_ID    0x053949b1   // BN_SIGNIN_OUT "GAMESPY ID LOGIN"
+#define BN_STEAM_ID      0x40919218   // OPTIONS: BN_OPTIONS_REFRESH_RATE
+#define BN_GRAPHICS_ID   0x835b97d7   // OPTIONS: BN_OPTIONS_CENTRE_SCREEN
+#define BN_INVITE_ID     0x72e30658   // BN_ONLINE_OPTIONS_FRIENDS
+#define BN_NAME_ID       0x33c9dd57   // BN_ONLINE_OPTIONS_OPTIONS
+#define BN_LOBBY_ID      0x1dfaca0c   // BN_ONLINE_OPTIONS_SCOREBOARDS
+#define BN_GFX_APPLY_ID  0x4304c950   // BTN_NET_OPTIONS_APPLY
+#define TYPE_TEXT        0x1c6e1bbb
+#define W_SHOWN          0x00108000   // 0x8000 visible, 0x00100000 present on PC
+
+enum { T_STEAM, T_GRAPHICS, T_INVITE, T_NAME, T_LOBBY, T_AA, T_FILTER, T_FPS,
+       T_AA_V, T_FILTER_V, T_FPS_V, T_APPLY, T_COOP, T_NOTICE, T_COUNT };
+#define T_HASH(i) (0x5D5D0000u + (uint32_t)(i))
+static uint16_t g_txt[T_COUNT][96];
+static void SetTxt(int i, const char *str)
+{
+    int n = 0;
+    for (; str[n] && n < 95; n++) g_txt[i][n] = (uint8_t)str[n];
+    g_txt[i][n] = 0;
+}
+
+typedef const uint16_t *(__fastcall *pfnLoc)(void *tbl, void *edx, uint32_t hash);
+static pfnLoc real_Loc;
+#define HASH_PLAY_LAN     0x0ec98d0f   // "LAN": MULTIPLAYER button + title of the LAN screen
+#define HASH_ESRB_NOTICE  0x8b3807d0   // "GAME EXPERIENCE MAY CHANGE DURING ONLINE PLAY"
+static const uint16_t *__fastcall Hook_Loc(void *tbl, void *edx, uint32_t hash)
+{
+    if (hash - T_HASH(0) < T_COUNT) return g_txt[hash - T_HASH(0)];
+    if ((hash == HASH_PLAY_LAN || hash == HASH_ESRB_NOTICE) && Tun_SteamStatus() >= 0)   // Steam play on
+        return g_txt[hash == HASH_PLAY_LAN ? T_COOP : T_NOTICE];
+    return real_Loc(tbl, edx, hash);
+}
+
+typedef void *(__fastcall *pfnGetScreen)(void *mgr, void *edx, uint32_t id);
+typedef void  (__fastcall *pfnGoScreen)(void *ui, void *edx, uint32_t id, int layer);
+typedef uint8_t *(__fastcall *pfnFindDeep)(void *container, void *edx, uint32_t id);
+typedef uint8_t *(__fastcall *pfnFindType)(void *container, void *edx, uint32_t type, int *idx);
+typedef int  (__fastcall *pfnEvent)(void *self, void *edx, int ev, void *arg);
+#define FindDeep ((pfnFindDeep)0x005a0500)
+#define FindType ((pfnFindType)0x005a01a0)
+
+static void GoScreen(uint32_t id) { ((pfnGoScreen)0x00599e20)(UI_ROOT, 0, id, 4); }
+static uint8_t *GetScreen(uint32_t id)
+{
+    uint8_t *ui = UI_ROOT;
+    if (!ui || !U32(ui, 0x28)) return NULL;
+    return ((pfnGetScreen)0x00597540)((void *)(uintptr_t)U32(ui, 0x28), 0, id);
+}
+static uint8_t *Find(uint8_t *scr, uint32_t id) { return scr ? FindDeep(scr + 0x24, 0, id) : NULL; }
+static void LabelRow(uint8_t *row, int t)       // a row's caption text widget
+{
+    uint8_t *tx = row ? FindType(row + 0x40, 0, TYPE_TEXT, NULL) : NULL;
+    if (tx) U32(tx, 0x48) = T_HASH(t);
+}
+static void LabelId(uint8_t *scr, uint32_t id, int t)
+{
+    uint8_t *tx = Find(scr, id);
+    if (tx) U32(tx, 0x48) = T_HASH(t);
+}
+static void LabelTitle(uint8_t *scr, uint32_t titleId, uint32_t oldHash, int t)
+{
+    uint8_t *w = Find(scr, titleId);
+    for (int o = 0x24; w && o < 0x100; o += 4)
+        if (U32(w, o) == oldHash) { U32(w, o) = T_HASH(t); return; }
+    logf("menus: title %08X not relabelled", titleId);
+}
+static void ShowRow(uint8_t *row) { if (row) U32(row, 0x20) |= W_SHOWN; }
+static float *RowY(uint8_t *row) { return (float *)(row + 0x28); }   // rect x, y, w, h at +0x24
+static float  RowH(uint8_t *row) { return *(float *)(row + 0x30); }
+
+static uint8_t *g_scrOpt, *g_scrSteam, *g_scrGfx, *g_mpInternet, *g_mainGamespy;
+static uint8_t *g_optVideo, *g_optAudio, *g_optSteam, *g_optGfx;
+
+// ---- GRAPHICS: dgVoodoo.conf (read by dgVoodoo when the game starts) ----
+static const char *const kAAVal[]   = { "off", "2x", "4x", "8x" };
+static const char *const kAALbl[]   = { "OFF", "2X", "4X", "8X" };
+static const char *const kFiltVal[] = { "appdriven", "bilinear", "trilinear", "4", "8", "16" };
+static const char *const kFiltLbl[] = { "GAME DEFAULT", "BILINEAR", "TRILINEAR", "ANISOTROPIC 4X", "ANISOTROPIC 8X", "ANISOTROPIC 16X" };
+static const char *const kFpsVal[]  = { "30", "60", "120", "144", "0" };
+static const char *const kFpsLbl[]  = { "30", "60", "120", "144", "UNLIMITED" };
+typedef struct {
+    uint32_t togId, valueId; const char *section, *key;
+    const char *const *vals, *const *lbls; int n, label, valueT;
+    uint8_t *tog, *value;
+} GfxOpt;
+static GfxOpt g_gfx[3] = {
+    { 0x214631f9, 0x5ea43dea, "DirectX",    "Antialiasing", kAAVal,   kAALbl,   4, T_AA,     T_AA_V },
+    { 0x8e0547aa, 0x733802e1, "DirectX",    "Filtering",    kFiltVal, kFiltLbl, 6, T_FILTER, T_FILTER_V },
+    { 0x8e45ca5d, 0x35102b0d, "GeneralExt", "FPSLimit",     kFpsVal,  kFpsLbl,  5, T_FPS,    T_FPS_V },
+};
+static uint8_t *g_gfxApply;
+
+static char *ReadFileAll(const char *path, long *len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); *len = ftell(f); fseek(f, 0, SEEK_SET);
+    char *b = (char *)malloc(*len + 1);
+    if (b) { *len = (long)fread(b, 1, *len, f); b[*len] = 0; }
+    fclose(f);
+    return b;
+}
+// Finds "key = value" in [section]; returns the value start and its length.
+static const char *ConfFind(const char *txt, const char *section, const char *key, int *vlen)
+{
+    int in = 0; size_t kl = strlen(key), sl = strlen(section);
+    for (const char *ln = txt; *ln; ) {
+        const char *end = strchr(ln, '\n'); if (!end) end = ln + strlen(ln);
+        const char *c = ln; while (c < end && (*c == ' ' || *c == '\t')) c++;
+        if (*c == '[') in = !_strnicmp(c + 1, section, sl) && c[1 + sl] == ']';
+        else if (in && !_strnicmp(c, key, kl) && (c[kl] == ' ' || c[kl] == '\t' || c[kl] == '=')) {
+            const char *eq = memchr(c, '=', end - c);
+            if (eq) {
+                const char *v = eq + 1; while (v < end && (*v == ' ' || *v == '\t')) v++;
+                const char *ve = v; while (ve < end && *ve != '\r' && *ve != ' ' && *ve != '\t' && *ve != ';') ve++;
+                *vlen = (int)(ve - v);
+                return v;
+            }
+        }
+        ln = *end ? end + 1 : end;
+    }
+    return NULL;
+}
+static void GfxLoad(void)
+{
+    char path[MAX_PATH]; long len;
+    snprintf(path, sizeof path, "%sdgVoodoo.conf", g_dir);
+    char *txt = ReadFileAll(path, &len);
+    for (int i = 0; i < 3; i++) {
+        GfxOpt *o = &g_gfx[i];
+        int v = 0, vl = 0;
+        const char *cur = txt ? ConfFind(txt, o->section, o->key, &vl) : NULL;
+        for (int k = 0; cur && k < o->n; k++)
+            if ((int)strlen(o->vals[k]) == vl && !_strnicmp(cur, o->vals[k], vl)) v = k;
+        if (o->tog) U8(o->tog, 0x74) = (uint8_t)v;
+    }
+    free(txt);
+    if (!txt) logf("menus: %s not found", path);
+}
+static int GfxSave(void)
+{
+    char path[MAX_PATH], bak[MAX_PATH]; long len;
+    snprintf(path, sizeof path, "%sdgVoodoo.conf", g_dir);
+    snprintf(bak, sizeof bak, "%sdgVoodoo.conf.squadmod.bak", g_dir);
+    char *txt = ReadFileAll(path, &len);
+    if (!txt) { logf("menus: cannot read %s", path); return 0; }
+    CopyFileA(path, bak, TRUE);                     // first save keeps the original
+    for (int i = 0; i < 3; i++) {
+        GfxOpt *o = &g_gfx[i];
+        if (!o->tog) continue;
+        const char *val = o->vals[U8(o->tog, 0x74) % o->n];
+        int vl; const char *cur = ConfFind(txt, o->section, o->key, &vl);
+        if (!cur) { logf("menus: [%s] %s not in dgVoodoo.conf", o->section, o->key); continue; }
+        size_t off = cur - txt, nl = strlen(val);
+        char *nt = (char *)malloc(len - vl + nl + 1);
+        memcpy(nt, txt, off); memcpy(nt + off, val, nl); memcpy(nt + off + nl, cur + vl, len - off - vl + 1);
+        free(txt); txt = nt; len = (long)(len - vl + nl);
+        logf("menus: dgVoodoo [%s] %s = %s", o->section, o->key, val);
+    }
+    FILE *f = fopen(path, "wb");
+    int ok = f && fwrite(txt, 1, len, f) == (size_t)len;
+    if (f) fclose(f);
+    free(txt);
+    return ok;
+}
+
+// ---- screen handlers (vtable slot 7 = event, slot 13 = per-frame update) ----
+static pfnEvent real_OptionsEvent, real_SteamEvent, real_GfxEvent, real_NetTogEvent;
+typedef void (__fastcall *pfnUpdate)(void *self, void *edx);
+#define BaseUpdate ((pfnUpdate)0x0059e010)
+
+static int __fastcall W_OptionsEvent(uint8_t *scr, void *edx, int ev, uint8_t *w)
+{
+    if (ev == 4 && w) {
+        if (U32(w, 0x14) == BN_STEAM_ID)    { GoScreen(SCR_STEAM_ID);    return 1; }
+        if (U32(w, 0x14) == BN_GRAPHICS_ID) { GoScreen(SCR_GRAPHICS_ID); return 1; }
+    }
+    return real_OptionsEvent(scr, edx, ev, w);
+}
+
+static void SteamText(void)
+{
+    int st = Tun_SteamStatus();
+    char names[160], line[96];
+    SetTxt(T_INVITE, st == 1 ? "INVITE FRIENDS" : st == 0 ? "INVITE FRIENDS (CONNECTING...)" : st == 2 ? "INVITE FRIENDS (RECONNECTING...)" : "INVITE FRIENDS (STEAM OFF)");
+    SetTxt(T_NAME, g_useSteamName ? "PLAYER NAME: STEAM NAME" : "PLAYER NAME: PROFILE NAME");
+    int n = Tun_LobbyNames(names, sizeof names);
+    if (st < 0)       snprintf(line, sizeof line, "STEAM PLAY IS OFF (STEAM=1 IN SQUADMOD.INI)");
+    else if (st == 0) snprintf(line, sizeof line, "LOBBY: CONNECTING TO STEAM...");
+    else if (st == 2) snprintf(line, sizeof line, "LOBBY: CONNECTION LOST - REJOINING...");
+    else              snprintf(line, sizeof line, "LOBBY (%d): %s", n, names);
+    SetTxt(T_LOBBY, line);
+    if (st == 1) snprintf(line, sizeof line, "STEAM LOBBY (%d): %s  -  INVITE FRIENDS WITH F7 OR OPTIONS > STEAM", n, names);
+    else         snprintf(line, sizeof line, st == 2 ? "STEAM LOBBY LOST - REJOINING..." : "CONNECTING TO STEAM...");
+    SetTxt(T_NOTICE, line);
+}
+static int __fastcall W_SteamEvent(uint8_t *scr, void *edx, int ev, uint8_t *w)
+{
+    if (ev == 4) {
+        if (!w) return 0;
+        if (U32(w, 0x14) == BN_INVITE_ID) {
+            if (Tun_SteamStatus() == 1) Tun_Invite();
+            return 1;
+        }
+        if (U32(w, 0x14) == BN_NAME_ID) {
+            g_useSteamName = !g_useSteamName;
+            WritePrivateProfileStringA("SquadMod", "SteamName", g_useSteamName ? "1" : "0", g_ini);
+            logf("menus: player name = %s", g_useSteamName ? "Steam" : "profile");
+            SteamText();
+            return 1;
+        }
+        return 1;                                     // LOBBY: nothing to do
+    }
+    if (ev == 5) { GoScreen(SCR_OPTIONS_ID); return 1; }   // back
+    if (ev == 0x15) { SteamText(); return 0; }              // entered (skip the GameSpy code)
+    return real_SteamEvent(scr, edx, ev, w);
+}
+static void __fastcall W_SteamUpdate(uint8_t *scr, void *edx)
+{
+    BaseUpdate(scr, edx);
+    static DWORD t;
+    if (GetTickCount() - t > 500) { t = GetTickCount(); SteamText(); }
+}
+
+static void GfxText(void)
+{
+    for (int i = 0; i < 3; i++) {
+        GfxOpt *o = &g_gfx[i];
+        if (!o->tog) continue;
+        U8(o->tog, 0x75) = 0; U8(o->tog, 0x76) = (uint8_t)(o->n - 1);
+        if (U8(o->tog, 0x74) >= o->n) U8(o->tog, 0x74) = 0;
+        SetTxt(o->valueT, o->lbls[U8(o->tog, 0x74)]);
+        if (o->value) U32(o->value, 0x48) = T_HASH(o->valueT);   // the game resets it on entry
+    }
+}
+static int __fastcall W_GfxEvent(uint8_t *scr, void *edx, int ev, uint8_t *w)
+{
+    if (ev == 4) {
+        // the event carries the screen, not the button: check the group's focused row (+0x50)
+        uint8_t *grp = g_gfxApply ? (uint8_t *)(uintptr_t)U32(g_gfxApply, 0x0c) : NULL;
+        if ((w && U32(w, 0x14) == BN_GFX_APPLY_ID) || (grp && (uint8_t *)(uintptr_t)U32(grp, 0x50) == g_gfxApply))
+            SetTxt(T_APPLY, GfxSave() ? "SAVED - RESTART THE GAME TO USE" : "COULD NOT SAVE DGVOODOO.CONF");
+        return 1;
+    }
+    if (ev == 5) { GoScreen(SCR_OPTIONS_ID); return 1; }
+    if (ev == 0x15) {
+        int r = real_GfxEvent(scr, edx, ev, w);
+        GfxLoad(); GfxText();
+        SetTxt(T_APPLY, "APPLY (AFTER RESTART)");
+        return r;
+    }
+    return real_GfxEvent(scr, edx, ev, w);
+}
+// The three toggles belong to a voice-chat toggle class; keep its code away from them.
+static int __fastcall W_NetTogEvent(uint8_t *tog, void *edx, int ev, void *arg)
+{
+    for (int i = 0; i < 3; i++) if (U32(tog, 0x14) == g_gfx[i].togId) return 0;
+    return real_NetTogEvent(tog, edx, ev, arg);
+}
+
+// ...and its per-frame update (0x510820 = base 0x5a5e70 + 0x510240, which rewrites
+// the value text and sets the GameSpy online status).
+static pfnUpdate real_NetTogUpdate;
+static void __fastcall W_NetTogUpdate(uint8_t *tog, void *edx)
+{
+    for (int i = 0; i < 3; i++)
+        if (U32(tog, 0x14) == g_gfx[i].togId) { ((pfnUpdate)0x005a5e70)(tog, edx); return; }
+    real_NetTogUpdate(tog, edx);
+}
+
+static int MenusSetup(void)
+{
+    g_scrOpt = GetScreen(SCR_OPTIONS_ID);
+    g_scrSteam = GetScreen(SCR_STEAM_ID);
+    g_scrGfx = GetScreen(SCR_GRAPHICS_ID);
+    if (!g_scrOpt || !g_scrSteam || !g_scrGfx) return 0;
+    if (U32(g_scrOpt, 0x14) != SCR_OPTIONS_ID || U32(g_scrSteam, 0x14) != SCR_STEAM_ID || U32(g_scrGfx, 0x14) != SCR_GRAPHICS_ID) {
+        logf("menus: screen lookup mismatch");
+        return -1;
+    }
+    g_optVideo = Find(g_scrOpt, 0x46016b2c);
+    g_optAudio = Find(g_scrOpt, 0xd0d96e32);
+    g_optSteam = Find(g_scrOpt, BN_STEAM_ID);
+    g_optGfx   = Find(g_scrOpt, BN_GRAPHICS_ID);
+    LabelRow(g_optSteam, T_STEAM);
+    LabelRow(g_optGfx, T_GRAPHICS);
+    // The group lays out and navigates its visible rows in child-array order, which
+    // puts these two between GAMMA and VIDEO. (Reordering the array makes the game
+    // quit when the VIDEO screen applies settings.)
+
+    LabelTitle(g_scrSteam, 0x08736add, 0x7e74ba26, T_STEAM);
+    LabelRow(Find(g_scrSteam, BN_INVITE_ID), T_INVITE);
+    LabelRow(Find(g_scrSteam, BN_NAME_ID), T_NAME);
+    LabelRow(Find(g_scrSteam, BN_LOBBY_ID), T_LOBBY);
+
+    LabelTitle(g_scrGfx, 0x0873dc9d, 0x7e74ba26, T_GRAPHICS);
+    for (int i = 0; i < 3; i++) {
+        g_gfx[i].tog = Find(g_scrGfx, g_gfx[i].togId);
+        LabelRow(g_gfx[i].tog, g_gfx[i].label);
+        g_gfx[i].value = Find(g_scrGfx, g_gfx[i].valueId);
+    }
+    g_gfxApply = Find(g_scrGfx, BN_GFX_APPLY_ID);
+    uint8_t *mp = GetScreen(SCR_MULTI_ID);
+    if (mp && U32(mp, 0x14) == SCR_MULTI_ID) g_mpInternet = Find(mp, BN_INTERNET_ID);
+    if (!g_mpInternet) logf("menus: MULTIPLAYER > INTERNET not found, left as is");
+    uint8_t *mm = GetScreen(SCR_MAIN_ID);
+    if (mm && U32(mm, 0x14) == SCR_MAIN_ID) g_mainGamespy = Find(mm, BN_GAMESPY_ID);
+    if (!g_mainGamespy) logf("menus: main menu GAMESPY ID LOGIN not found, left as is");
+    LabelRow(g_gfxApply, T_APPLY);
+    logf("menus: STEAM and GRAPHICS screens ready (%p %p %p %p)", g_optSteam, g_optGfx, g_gfx[0].tog, g_gfxApply);
+    return 1;
+}
+
+// Every frame (Present): keep the rows shown and laid out (positions scale with the
+// resolution, so they are derived from rows the game placed itself).
+static void MenuFrame(void)
+{
+    static int state;              // 0 = not yet, 1 = ready, -1 = gave up
+    static DWORD next;
+    if (state == 0) {
+        if (GetTickCount() < next) return;
+        next = GetTickCount() + 1000;
+        state = MenusSetup();
+        if (state <= 0) return;
+    }
+    if (state < 0) return;
+    if (g_mpInternet) U32(g_mpInternet, 0x20) &= ~0x8000u;
+    if (g_mainGamespy) U32(g_mainGamespy, 0x20) &= ~0x8000u;   // hidden rows are skipped by layout + navigation
+    static DWORD tText;
+    if (GetTickCount() - tText > 500) { tText = GetTickCount(); SteamText(); }   // lobby line in MULTIPLAYER
+    ShowRow(g_optSteam); ShowRow(g_optGfx);
+    ShowRow(Find(g_scrSteam, BN_INVITE_ID)); ShowRow(Find(g_scrSteam, BN_NAME_ID)); ShowRow(Find(g_scrSteam, BN_LOBBY_ID));
+    uint8_t *pic = Find(g_scrSteam, 0xfeab8365);         // GameSpy friend-message icon
+    if (pic) U32(pic, 0x20) &= ~0x8000u;
+    if (g_gfx[0].tog && g_gfxApply) {
+        float y0 = *RowY(g_gfx[0].tog), step = RowH(g_gfx[0].tog);
+        for (int i = 0; i < 3; i++) if (g_gfx[i].tog) { ShowRow(g_gfx[i].tog); *RowY(g_gfx[i].tog) = y0 + step * i; }
+        ShowRow(g_gfxApply); *RowY(g_gfxApply) = y0 + step * 3;
+        GfxText();
+    }
+}
+
+static void InstallMenus(void)
+{
+    static const uint8_t locExpect[] = { 0x8B, 0x41, 0x38, 0x85, 0xC0, 0x76 };
+    if (memcmp((void *)0x00686a10, locExpect, sizeof locExpect)) { logf("menus: unexpected bytes at 00686A10, menus off"); return; }
+    uint8_t *t = (uint8_t *)VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t) return;
+    memcpy(t, (void *)0x00686a10, 5);                    // mov eax,[ecx+38h]; test eax,eax
+    t[5] = 0xE9; *(int32_t *)(t + 6) = (int32_t)(0x00686a15 - (uintptr_t)(t + 10));
+    real_Loc = (pfnLoc)t;
+    if (!WriteJmp(0x00686a10, (void *)Hook_Loc)) return;
+    SetTxt(T_STEAM, "STEAM"); SetTxt(T_GRAPHICS, "GRAPHICS");
+    SetTxt(T_AA, "ANTI-ALIASING"); SetTxt(T_FILTER, "TEXTURE FILTERING"); SetTxt(T_FPS, "FRAME RATE LIMIT");
+    SetTxt(T_APPLY, "APPLY (AFTER RESTART)");
+    SetTxt(T_COOP, "STEAM CO-OP");
+    SteamText();
+    for (int i = 0; i < 3; i++) SetTxt(g_gfx[i].valueT, "");
+    PatchVtbl((void **)0x006cd730, 7, (void *)W_OptionsEvent, (void **)&real_OptionsEvent);
+    PatchVtbl((void **)0x006ce4f0, 7, (void *)W_SteamEvent, (void **)&real_SteamEvent);
+    static void *origSteamUpdate;
+    PatchVtbl((void **)0x006ce4f0, 13, (void *)W_SteamUpdate, &origSteamUpdate);
+    PatchVtbl((void **)0x006ce558, 7, (void *)W_GfxEvent, (void **)&real_GfxEvent);
+    PatchVtbl((void **)0x006cd620, 7, (void *)W_NetTogEvent, (void **)&real_NetTogEvent);
+    PatchVtbl((void **)0x006cd620, 13, (void *)W_NetTogUpdate, (void **)&real_NetTogUpdate);
+    logf("menus: hooks installed");
+}
+
 static int IniInt(const char *ini, const char *key, int def)
 {
     return GetPrivateProfileIntA("SquadMod", key, def, ini);
+}
+
+// ---- diagnostics (Debug=1): why the game quits ----
+static LONG CALLBACK DiagVeh(EXCEPTION_POINTERS *e)
+{
+    DWORD c = e->ExceptionRecord->ExceptionCode;
+    if (c == 0xC0000005 || c == 0xC000001D || c == 0xC0000096 || c == 0xC00000FD || c == 0xC0000409) {
+        static int n;
+        if (n++ < 20) logf("diag: exception %08X at %08X (ecx %08X esi %08X)", (unsigned)c,
+            (unsigned)e->ContextRecord->Eip, (unsigned)e->ContextRecord->Ecx, (unsigned)e->ContextRecord->Esi);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+typedef void (WINAPI *pfnExitProcess)(UINT);
+static pfnExitProcess real_ExitProcess;
+static void WINAPI Hook_ExitProcess(UINT code)
+{
+    void *ret = __builtin_return_address(0);
+    uint32_t *sp = (uint32_t *)__builtin_frame_address(0);
+    logf("diag: ExitProcess(%u) from %p, stack %08X %08X %08X %08X %08X %08X %08X %08X", code, ret,
+         sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], sp[9]);
+    real_ExitProcess(code);
 }
 
 static void Init(HMODULE self)
@@ -1471,6 +2182,8 @@ static void Init(HMODULE self)
 
     char ini[MAX_PATH];
     snprintf(ini, sizeof ini, "%ssquadmod.ini", g_dir);
+    snprintf(g_ini, sizeof g_ini, "%s", ini);
+    LoadDisplay();
     cfg.enabled    = IniInt(ini, "Enabled", 1);
     cfg.fillCount  = IniInt(ini, "FillCount", 4);
     cfg.hostOwnsAI = IniInt(ini, "HostOwnsAI", 1);
@@ -1478,6 +2191,8 @@ static void Init(HMODULE self)
     cfg.loopback   = IniInt(ini, "LoopbackTest", 0);
     cfg.freeMouse  = IniInt(ini, "FreeMouse", 1);
     cfg.debug      = IniInt(ini, "Debug", 0);
+    cfg.steam      = IniInt(ini, "Steam", 0);
+    cfg.tunnelTest = IniInt(ini, "TunnelTest", 0);
     if (cfg.fillCount < 1) cfg.fillCount = 1;
     if (cfg.fillCount > 4) cfg.fillCount = 4;
 
@@ -1525,6 +2240,11 @@ static void Init(HMODULE self)
         }
     }
 
+    if (cfg.debug) {
+        AddVectoredExceptionHandler(1, DiagVeh);
+        real_ExitProcess = (pfnExitProcess)PatchIAT("KERNEL32.dll", "ExitProcess", (void *)Hook_ExitProcess);
+        logf("diag: exception + ExitProcess logging %s", real_ExitProcess ? "on" : "partly on");
+    }
     real_CreateMutexA = (pfnCreateMutexA)PatchIAT("KERNEL32.dll", "CreateMutexA", (void *)Hook_CreateMutexA);
     real_CreateEventA = (pfnCreateEventA)PatchIAT("KERNEL32.dll", "CreateEventA", (void *)Hook_CreateEventA);
     real_OpenEventA   = (pfnOpenEventA)  PatchIAT("KERNEL32.dll", "OpenEventA",   (void *)Hook_OpenEventA);
@@ -1556,11 +2276,23 @@ static void Init(HMODULE self)
         logf("Direct3DCreate9 hook: %s", real_D3DCreate9 ? "ok" : "FAILED");
     }
 
-    if (!cfg.loopback && cfg.enabled) {
+    InstallVideoScreen();
+    g_useSteamName = IniInt(ini, "SteamName", 1);
+    InstallMenus();
+    int tunMode = cfg.steam ? 2 : (cfg.loopback && cfg.tunnelTest) ? 1 : 0;
+    if (tunMode == 2) {
+        static const uint8_t nameExpect[] = { 0x80, 0x3D, 0xC4, 0x17, 0x70, 0x00, 0xFD };
+        if (!memcmp((void *)0x0058f300, nameExpect, sizeof nameExpect) && WriteJmp(0x0058f300, (void *)Hook_ApplyLocalName))
+            logf("player name: Steam name will be used in game");
+        else logf("player name: unexpected bytes at 0058F300, keeping profile name");
+    }
+    if (tunMode) {
+        Tun_Start(tunMode, g_instance, g_dir, logf, PatchIAT, &g_hostIp);
+    } else if (!cfg.loopback && cfg.enabled) {
         real_connect = (pfnConnect)PatchIAT("WSOCK32.dll", "connect", (void *)Hook_connect);
         if (!real_connect) real_connect = connect;
     }
-    if (cfg.loopback) {
+    if (cfg.loopback && !tunMode) {
         real_bind   = (pfnBind)  PatchIAT("WSOCK32.dll", "bind",   (void *)Hook_bind);
         real_sendto = (pfnSendto)PatchIAT("WSOCK32.dll", "sendto", (void *)Hook_sendto);
         real_connect       = (pfnConnect)      PatchIAT("WSOCK32.dll", "connect",       (void *)Hook_connect);
