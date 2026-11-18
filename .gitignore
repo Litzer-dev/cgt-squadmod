@@ -1,0 +1,7 @@
+*.log
+*.pdb
+*.lib
+*.bak*
+*.obj
+zig-cache/
+.zig-cache/
